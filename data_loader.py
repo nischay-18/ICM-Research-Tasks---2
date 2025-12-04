@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, field 
 
 # --- DATACLASS DEFINITION (Required for Example objects) ---
+# NOTE: This Example class definition is required if it's not imported from icm_core
 @dataclass
 class Example:
     question: str
@@ -25,9 +26,8 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     """
     Downloads and formats GlobalOpinionQA data for a specific country.
     
-    NOTE: This function is robust against data inconsistencies in the 
-    'anthropic/llm_global_opinions' dataset by checking multiple key locations 
-    and ensuring proper key existence before access.
+    This function includes robust logic to handle the inconsistent location of 
+    options and scores within the loaded dataset items.
     """
     try:
         # Load the dataset from HuggingFace
@@ -59,7 +59,6 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
                 continue
 
         # 2. ROBUSTLY GET OPTIONS (The list of answer choices)
-        # Based on your data, the options list is likely under item['options']
         options = item.get('options') 
         
         # Fallback check for nested options structure
@@ -71,10 +70,21 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
             continue
             
         # 3. ROBUSTLY GET SCORES (The country opinion data)
-        # Based on your data, the scores dictionary is under item['selections']
-        all_scores = item.get('selections') 
-        if not isinstance(all_scores, dict) or not all_scores:
-            logger.warning("Skipping item: Missing or malformed score data in 'selections' key.")
+        all_scores = None
+        
+        # Priority 1: Check where you observed the score data (item['selections'])
+        potential_scores = item.get('selections')
+        if isinstance(potential_scores, dict) and potential_scores:
+            all_scores = potential_scores
+        
+        # Priority 2: Check the alternate key used by the dataset (item['scores'])
+        if all_scores is None:
+            potential_scores = item.get('scores')
+            if isinstance(potential_scores, dict) and potential_scores:
+                all_scores = potential_scores
+
+        if all_scores is None:
+            logger.warning("Skipping item: Missing or malformed score data in 'selections' or 'scores' key.")
             continue
         
         # 4. Filter for binary-style Agree/Disagree questions

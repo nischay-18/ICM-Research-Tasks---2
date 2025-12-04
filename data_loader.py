@@ -3,9 +3,9 @@ from datasets import load_dataset
 from typing import List
 import json
 from dataclasses import dataclass, field 
+import ast # <--- NEW IMPORT for safe evaluation of Python-specific strings
 
 # --- DATACLASS DEFINITION (Required for Example objects) ---
-# NOTE: This Example class definition is required if it's not imported from icm_core
 @dataclass
 class Example:
     question: str
@@ -22,12 +22,35 @@ class Example:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- ULTIMATE HELPER FUNCTION FOR SCORE RETRIEVAL ---
+def get_and_evaluate_scores(item, key):
+    """
+    Safely retrieves score data and evaluates it from a string using ast.literal_eval, 
+    which can handle non-standard dict representations like defaultdict.
+    """
+    potential = item.get(key)
+    
+    # If the value is a string, try to evaluate it into a dictionary
+    if isinstance(potential, str):
+        try:
+            # Clean up the string to remove defaultdict or class references
+            potential = potential.replace("defaultdict(<class 'list'>, ", "").rstrip(')')
+            
+            # Use ast.literal_eval to safely convert the string to a dictionary
+            potential = ast.literal_eval(potential)
+        except (ValueError, SyntaxError):
+            return None
+    
+    # Only return if it's a non-empty dictionary
+    if isinstance(potential, dict) and potential:
+        return potential
+    return None
+# ----------------------------------------------------
+
+
 def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     """
     Downloads and formats GlobalOpinionQA data for a specific country.
-    
-    This function includes robust logic to handle the inconsistent location of 
-    options and scores within the loaded dataset items.
     """
     try:
         # Load the dataset from HuggingFace
@@ -50,7 +73,7 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     target_code = code_map.get(country_name, country_name)
     
     for item in ds:
-        # 1. Ensure item is a dictionary (handles items loaded as JSON strings)
+        # 1. Ensure item is a dictionary (handles top-level items loaded as JSON strings)
         if isinstance(item, str):
             try:
                 item = json.loads(item)
@@ -69,19 +92,15 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
             logger.warning("Skipping item: Missing options list in 'options' or nested under 'selections'.")
             continue
             
-        # 3. ROBUSTLY GET SCORES (The country opinion data)
+        # 3. ROBUSTLY GET SCORES (The country opinion data, checking both keys and evaluating strings)
         all_scores = None
         
         # Priority 1: Check where you observed the score data (item['selections'])
-        potential_scores = item.get('selections')
-        if isinstance(potential_scores, dict) and potential_scores:
-            all_scores = potential_scores
+        all_scores = get_and_evaluate_scores(item, 'selections')
         
         # Priority 2: Check the alternate key used by the dataset (item['scores'])
         if all_scores is None:
-            potential_scores = item.get('scores')
-            if isinstance(potential_scores, dict) and potential_scores:
-                all_scores = potential_scores
+            all_scores = get_and_evaluate_scores(item, 'scores')
 
         if all_scores is None:
             logger.warning("Skipping item: Missing or malformed score data in 'selections' or 'scores' key.")

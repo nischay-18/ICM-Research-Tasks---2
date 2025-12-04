@@ -1,11 +1,26 @@
-from datasets import load_dataset
-import pandas as pd
-from icm_core import Example
 import logging
+from datasets import load_dataset
+from typing import List
+import json                                                                     
+from dataclasses import dataclass, field                                        
 
+@dataclass
+class Example:                                                                  
+    question: str
+    choice: str
+    label: int = 0
+    predicted_label: int = 0
+    id: str = ""
+    
+    def to_text(self, label_val: int) -> str:
+        lbl_str = "Yes" if label_val == 1 else "No"
+        return f"Question: {self.question}\nDoes the persona agree?: {lbl_str}"
+                                                                                ### <--- END DATACLASS
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def prepare_country_data(country_name, n_samples=120):
+def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     """
     Downloads and formats GlobalOpinionQA data for a specific country.
     """
@@ -19,7 +34,6 @@ def prepare_country_data(country_name, n_samples=120):
     examples = []
     
     # Map input country names to dataset keys
-    # The dataset uses 2-letter ISO codes (US, IN, CN, etc.)
     code_map = {
         'United States': 'US', 'US': 'US', 
         'China': 'CN', 'CN': 'CN',
@@ -31,8 +45,25 @@ def prepare_country_data(country_name, n_samples=120):
     target_code = code_map.get(country_name, country_name)
     
     for item in ds:
-        options = item['selections']['options']
-        
+        # Ensure item is a dictionary before access (Fix for data items loaded as strings)
+        if isinstance(item, str):                                               ### <--- ADD THIS CHECK
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                logger.warning("Skipping item: Failed to decode JSON string.")
+                continue
+        # 🌟 FIX: Check for the options list in its expected locations 🌟
+        # The key for options is either 'options' or nested under 'selections'
+        options = None
+        if 'options' in item and isinstance(item['options'], list):
+            options = item['options']
+        elif 'selections' in item and isinstance(item['selections'], dict) and 'options' in item['selections'] and isinstance(item['selections']['options'], list):
+            options = item['selections']['options']
+            
+        if options is None:
+            logger.warning("Skipping item: Missing options list in expected locations.")
+            continue                                                            ### <--- END FIX BLOCK
+
         # Filter for binary-style Agree/Disagree questions
         # We only want questions where the options include both "Agree" and "Disagree"
         if not (any("Agree" in opt for opt in options) and any("Disagree" in opt for opt in options)):
@@ -46,6 +77,10 @@ def prepare_country_data(country_name, n_samples=120):
         
         try:
             # item['scores'] corresponds to the options list
+            if 'scores' not in item or not isinstance(item['scores'], dict):     ### <--- ADD CHECK FOR 'scores' KEY
+                logger.warning("Skipping item: Missing or malformed 'scores'.")
+                continue
+
             agree_scores = item['scores'][agree_idx]
             disagree_scores = item['scores'][disagree_idx]
             
@@ -69,7 +104,8 @@ def prepare_country_data(country_name, n_samples=120):
             
             if len(examples) >= n_samples: break
             
-        except Exception: 
+        except Exception as e:                                                  
+            logger.debug(f"Skipping item due to score/index mismatch or generic error: {e}") 
             continue
             
     logger.info(f"Loaded {len(examples)} examples for {country_name}")

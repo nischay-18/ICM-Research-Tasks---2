@@ -1,11 +1,12 @@
 import logging
 from datasets import load_dataset
 from typing import List
-import json                                                                     
-from dataclasses import dataclass, field                                        
+import json
+from dataclasses import dataclass, field 
 
+# --- DATACLASS DEFINITION (Required for Example objects) ---
 @dataclass
-class Example:                                                                  
+class Example:
     question: str
     choice: str
     label: int = 0
@@ -15,7 +16,7 @@ class Example:
     def to_text(self, label_val: int) -> str:
         lbl_str = "Yes" if label_val == 1 else "No"
         return f"Question: {self.question}\nDoes the persona agree?: {lbl_str}"
-                                                                                ### <--- END DATACLASS
+# -----------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     """
     Downloads and formats GlobalOpinionQA data for a specific country.
+    
+    NOTE: This function is robust against data inconsistencies in the 
+    'anthropic/llm_global_opinions' dataset by checking multiple key locations 
+    and ensuring proper key existence before access.
     """
     try:
         # Load the dataset from HuggingFace
@@ -45,27 +50,34 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
     target_code = code_map.get(country_name, country_name)
     
     for item in ds:
-        # Ensure item is a dictionary before access (Fix for data items loaded as strings)
-        if isinstance(item, str):                                               ### <--- ADD THIS CHECK
+        # 1. Ensure item is a dictionary (handles items loaded as JSON strings)
+        if isinstance(item, str):
             try:
                 item = json.loads(item)
             except json.JSONDecodeError:
                 logger.warning("Skipping item: Failed to decode JSON string.")
                 continue
-        # 🌟 FIX: Check for the options list in its expected locations 🌟
-        # The key for options is either 'options' or nested under 'selections'
-        options = None
-        if 'options' in item and isinstance(item['options'], list):
-            options = item['options']
-        elif 'selections' in item and isinstance(item['selections'], dict) and 'options' in item['selections'] and isinstance(item['selections']['options'], list):
+
+        # 2. ROBUSTLY GET OPTIONS (The list of answer choices)
+        # Based on your data, the options list is likely under item['options']
+        options = item.get('options') 
+        
+        # Fallback check for nested options structure
+        if not isinstance(options, list) and 'selections' in item and isinstance(item['selections'], dict) and 'options' in item['selections'] and isinstance(item['selections']['options'], list):
             options = item['selections']['options']
             
-        if options is None:
-            logger.warning("Skipping item: Missing options list in expected locations.")
-            continue                                                            ### <--- END FIX BLOCK
-
-        # Filter for binary-style Agree/Disagree questions
-        # We only want questions where the options include both "Agree" and "Disagree"
+        if options is None or not options:
+            logger.warning("Skipping item: Missing options list in 'options' or nested under 'selections'.")
+            continue
+            
+        # 3. ROBUSTLY GET SCORES (The country opinion data)
+        # Based on your data, the scores dictionary is under item['selections']
+        all_scores = item.get('selections') 
+        if not isinstance(all_scores, dict) or not all_scores:
+            logger.warning("Skipping item: Missing or malformed score data in 'selections' key.")
+            continue
+        
+        # 4. Filter for binary-style Agree/Disagree questions
         if not (any("Agree" in opt for opt in options) and any("Disagree" in opt for opt in options)):
             continue
             
@@ -76,23 +88,25 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
         if agree_idx == -1 or disagree_idx == -1: continue
         
         try:
-            # item['scores'] corresponds to the options list
-            if 'scores' not in item or not isinstance(item['scores'], dict):     ### <--- ADD CHECK FOR 'scores' KEY
-                logger.warning("Skipping item: Missing or malformed 'scores'.")
-                continue
-
-            agree_scores = item['scores'][agree_idx]
-            disagree_scores = item['scores'][disagree_idx]
             
-            # Skip if the target country doesn't have data for this specific question
-            if target_code not in agree_scores or target_code not in disagree_scores: 
+            agree_score_list = {}
+            disagree_score_list = {}
+            
+            # Extract scores for the target options across all countries present in this item
+            for country_code, scores_list in all_scores.items():
+                if len(scores_list) > agree_idx:
+                    agree_score_list[country_code] = scores_list[agree_idx]
+                if len(scores_list) > disagree_idx:
+                    disagree_score_list[country_code] = scores_list[disagree_idx]
+
+            # Check if the target country has data for BOTH options
+            if target_code not in agree_score_list or target_code not in disagree_score_list: 
                 continue
                 
-            s_agree = agree_scores[target_code]
-            s_disagree = disagree_scores[target_code]
+            s_agree = agree_score_list[target_code]
+            s_disagree = disagree_score_list[target_code]
             
             # Create Binary Label (1 = Agree, 0 = Disagree)
-            # We determine the "Gold Label" by checking which score is higher for that country
             label = 1 if s_agree > s_disagree else 0
             
             examples.append(Example(
@@ -104,7 +118,8 @@ def prepare_country_data(country_name, n_samples=120) -> List[Example]:
             
             if len(examples) >= n_samples: break
             
-        except Exception as e:                                                  
+        except Exception as e: 
+            # Catch exceptions from dictionary key lookups or indexing errors
             logger.debug(f"Skipping item due to score/index mismatch or generic error: {e}") 
             continue
             

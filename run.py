@@ -399,16 +399,16 @@ async def main():
     # Countries to process (using EXACT dataset names)
     # Run get_available_countries() to see all options
     countries = [
-        "Germany",
-        "Britain",  
-        "France",
-        "Japan",
-        "Australia",
-        "Canada",
-        "Spain",
-        "Italy",
-        "Poland",
-        "South Korea",
+    "Kenya",
+    "Ethiopia", 
+    "Zimbabwe",
+    "Russia",
+    "Germany",
+    "Pakistan",
+    "Turkey",
+    "United States",
+    "Lebanon",
+    "Nigeria",
     ]
     
     # Use all available data (None) or limit samples

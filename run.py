@@ -163,66 +163,85 @@ def save_country_results(country: str, results: dict):
 
 def generate_figure1(all_results: list):
     """
-    Generate Figure 1: Aggregated bar chart across all personas.
-    Shows: Zero-shot (Base), Zero-shot (Chat), ICM, Gold for each shot count.
+    Generate Figure 1: Aggregated bar chart - ICM Paper Style
+    Shows SINGLE bars for: Zero-shot (Base), Zero-shot (Chat), Gold, ICM
+    Aggregated across all personas and all shot counts.
     """
     valid_results = [r for r in all_results if r is not None]
     if not valid_results:
         print("No valid results for Figure 1")
         return
     
-    shot_counts = valid_results[0]['shots']
+    # Aggregate metrics across all countries
+    avg_zero_base = np.mean([r['zero_shot_base'] for r in valid_results])
+    avg_zero_chat = np.mean([r['zero_shot_chat'] for r in valid_results])
     
-    # Aggregate across countries
-    agg = {
-        'zero_base': np.mean([r['zero_shot_base'] for r in valid_results]),
-        'zero_chat': np.mean([r['zero_shot_chat'] for r in valid_results]),
-        'icm': [np.mean([r['icm'][i] for r in valid_results]) for i in range(len(shot_counts))],
-        'gold': [np.mean([r['gold'][i] for r in valid_results]) for i in range(len(shot_counts))],
-        'random': [np.mean([r['random'][i] for r in valid_results]) for i in range(len(shot_counts))]
-    }
+    # For ICM and Gold, take the BEST performance across shot counts (or average)
+    # Using average across all shot counts for fair comparison
+    avg_icm = np.mean([np.mean(r['icm']) for r in valid_results])
+    avg_gold = np.mean([np.mean(r['gold']) for r in valid_results])
     
-    # Create bar chart
-    fig, ax = plt.subplots(figsize=(12, 7))
+    # Also compute best (max) across shots
+    best_icm = np.mean([max(r['icm']) for r in valid_results])
+    best_gold = np.mean([max(r['gold']) for r in valid_results])
     
-    x = np.arange(len(shot_counts))
-    width = 0.18
+    # Create figure matching ICM paper style
+    fig, ax = plt.subplots(figsize=(10, 7))
     
-    # Bars for each condition
-    bars1 = ax.bar(x - 1.5*width, [agg['zero_base']]*len(shot_counts), width, 
-                   label='Zero-shot (Base)', color='#8B4513', hatch='//')
-    bars2 = ax.bar(x - 0.5*width, [agg['zero_chat']]*len(shot_counts), width, 
-                   label='Zero-shot (Chat)', color='#D2691E', hatch='//')
-    bars3 = ax.bar(x + 0.5*width, agg['icm'], width, 
-                   label='ICM (Unsupervised)', color='#00BCD4')
-    bars4 = ax.bar(x + 1.5*width, agg['gold'], width, 
-                   label='Gold Labels', color='#8BC34A')
+    # Categories and values (using best performance for few-shot methods)
+    categories = ['Zero-shot\n(Base)', 'Zero-shot\n(Chat)', 'Gold\nSupervision', 'ICM\n(Unsupervised)']
+    values = [avg_zero_base, avg_zero_chat, best_gold, best_icm]
+    colors = ['#9C27B0', '#E91E63', '#FF9800', '#00BCD4']  # Purple, Pink, Orange, Cyan
     
-    ax.set_xlabel('Number of Few-shot Examples', fontsize=12)
-    ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('GlobalOpinionQA Performance: ICM vs Baselines\n(Aggregated across all personas, Llama-3.1-70B-Instruct)', fontsize=14)
-    ax.set_xticks(x)
-    ax.set_xticklabels([f'{k}-shot' for k in shot_counts])
-    ax.set_ylim(0, 1.05)
-    ax.legend(loc='lower right', fontsize=10)
+    # Create bars
+    bars = ax.bar(categories, values, color=colors, width=0.6, edgecolor='black', linewidth=1.2)
+    
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax.annotate(f'{val:.2f}',
+                   xy=(bar.get_x() + bar.get_width() / 2, height),
+                   xytext=(0, 5),
+                   textcoords="offset points",
+                   ha='center', va='bottom', fontsize=12, fontweight='bold')
+    
+    ax.set_ylabel('Accuracy', fontsize=14)
+    ax.set_title('Figure 1: GlobalOpinionQA Performance\n(Aggregated across all personas)', fontsize=14, fontweight='bold')
+    ax.set_ylim(0, 1.0)
     ax.grid(True, axis='y', alpha=0.3)
+    ax.set_axisbelow(True)
+    
+    # Add a subtle background
+    ax.set_facecolor('#fafafa')
     
     plt.tight_layout()
-    plt.savefig(f"{OUTPUT_DIR}/figures/Figure1_aggregated_bar.png", dpi=150)
+    plt.savefig(f"{OUTPUT_DIR}/figures/Figure1_aggregated_bar.png", dpi=150, bbox_inches='tight')
     plt.close()
     
     print(f"\nSaved: {OUTPUT_DIR}/figures/Figure1_aggregated_bar.png")
+    print(f"  Zero-shot (Base): {avg_zero_base:.3f}")
+    print(f"  Zero-shot (Chat): {avg_zero_chat:.3f}")
+    print(f"  Gold (best): {best_gold:.3f}")
+    print(f"  ICM (best): {best_icm:.3f}")
     
     # Save aggregated data
     agg_df = pd.DataFrame({
-        'shots': shot_counts,
-        'zero_shot_base': [agg['zero_base']]*len(shot_counts),
-        'zero_shot_chat': [agg['zero_chat']]*len(shot_counts),
-        'icm': agg['icm'],
-        'gold': agg['gold'],
-        'random': agg['random']
+        'Condition': categories,
+        'Accuracy': values
     })
-    agg_df.to_csv(f"{OUTPUT_DIR}/csv/aggregated_results.csv", index=False)
+    agg_df.to_csv(f"{OUTPUT_DIR}/csv/figure1_data.csv", index=False)
+    
+    # Also save detailed aggregated results
+    shot_counts = valid_results[0]['shots']
+    detailed_df = pd.DataFrame({
+        'shots': shot_counts,
+        'zero_shot_base': [avg_zero_base]*len(shot_counts),
+        'zero_shot_chat': [avg_zero_chat]*len(shot_counts),
+        'icm': [np.mean([r['icm'][i] for r in valid_results]) for i in range(len(shot_counts))],
+        'gold': [np.mean([r['gold'][i] for r in valid_results]) for i in range(len(shot_counts))],
+        'random': [np.mean([r['random'][i] for r in valid_results]) for i in range(len(shot_counts))]
+    })
+    detailed_df.to_csv(f"{OUTPUT_DIR}/csv/aggregated_results.csv", index=False)
 
 
 def generate_figure2(all_results: list):

@@ -6,6 +6,7 @@ import asyncio
 from tqdm import tqdm
 import logging
 import aiohttp
+import copy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,13 +36,9 @@ class VLLMClient:
     """Client for vLLM OpenAI-compatible API."""
     
     def __init__(self, api_key: str, base_url: str, model_name: str):
-        # vLLM serves OpenAI-compatible endpoints
         self.base_url = base_url.rstrip('/')
         self.url = f"{self.base_url}/completions"
-        self.headers = {
-            "Content-Type": "application/json"
-        }
-        # Only add auth header if API key is provided and not empty
+        self.headers = {"Content-Type": "application/json"}
         if api_key and api_key.strip():
             self.headers["Authorization"] = f"Bearer {api_key}"
         
@@ -53,10 +50,7 @@ class VLLMClient:
         session: aiohttp.ClientSession, 
         context_prompt: str
     ) -> Tuple[float, float]:
-        """
-        Gets log probabilities for Yes/No tokens.
-        Returns (yes_logprob, no_logprob).
-        """
+        """Gets log probabilities for Yes/No tokens."""
         payload = {
             "model": self.model_name,
             "prompt": context_prompt,
@@ -68,19 +62,13 @@ class VLLMClient:
         
         try:
             async with session.post(
-                self.url, 
-                headers=self.headers, 
-                json=payload,
+                self.url, headers=self.headers, json=payload,
                 timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status != 200:
-                    text = await response.text()
-                    logger.error(f"API Error {response.status}: {text[:200]}")
                     return -10.0, -10.0
                 
                 result = await response.json()
-                
-                # Navigate OpenAI-compatible response
                 choices = result.get('choices', [])
                 if not choices:
                     return -10.0, -10.0
@@ -91,11 +79,8 @@ class VLLMClient:
                 if not top_logprobs_list:
                     return -10.0, -10.0
                 
-                # Get first token's logprobs
                 top_dict = top_logprobs_list[0]
-                
-                yes_score = -999.0
-                no_score = -999.0
+                yes_score, no_score = -999.0, -999.0
                 
                 for token, logprob in top_dict.items():
                     t = token.strip().lower()
@@ -106,17 +91,12 @@ class VLLMClient:
                 
                 return yes_score, no_score
                 
-        except asyncio.TimeoutError:
-            logger.error("Request timed out")
-            return -10.0, -10.0
         except Exception as e:
-            logger.error(f"Logprob Exception: {e}")
+            logger.debug(f"Logprob error: {e}")
             return -10.0, -10.0
 
     async def get_completion(
-        self, 
-        session: aiohttp.ClientSession, 
-        prompt: str
+        self, session: aiohttp.ClientSession, prompt: str
     ) -> str:
         """Gets text completion from the model."""
         payload = {
@@ -129,58 +109,33 @@ class VLLMClient:
         
         try:
             async with session.post(
-                self.url, 
-                headers=self.headers, 
-                json=payload,
+                self.url, headers=self.headers, json=payload,
                 timeout=aiohttp.ClientTimeout(total=60)
             ) as response:
                 if response.status != 200:
                     return ""
                 result = await response.json()
-                
                 choices = result.get('choices', [])
-                if not choices:
-                    return ""
-                
-                return choices[0].get('text', "")
-                
-        except Exception as e:
-            logger.debug(f"Completion error: {e}")
+                return choices[0].get('text', "") if choices else ""
+        except Exception:
             return ""
 
 
 class ICM:
-    """
-    In-Context Matching for persona elicitation.
-    Implements the ICM algorithm from the paper.
-    """
+    """In-Context Matching for persona elicitation."""
     
-    def __init__(
-        self, 
-        api_key: str, 
-        base_url: str, 
-        model_name: str, 
-        config: ICMConfig
-    ):
+    def __init__(self, api_key: str, base_url: str, model_name: str, config: ICMConfig):
         self.config = config
         self.client = VLLMClient(api_key, base_url, model_name)
 
-    def create_icm_prompt(
-        self, 
-        target_ex: Example, 
-        context_examples: List[Example]
-    ) -> str:
-        """Creates the ICM prompt with context examples."""
+    def create_icm_prompt(self, target_ex: Example, context_examples: List[Example]) -> str:
         prompt = "The following are questions and whether a specific persona agrees with them.\n\n"
-        
         for ex in context_examples:
             prompt += ex.to_text(ex.predicted_label) + "\n\n"
-        
         prompt += f"Question: {target_ex.question}\nDoes the persona agree?:"
         return prompt
     
     def apply_llama3_chat_template(self, system_msg: str, user_msg: str) -> str:
-        """Applies Llama-3 chat template format."""
         return (
             f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
             f"{system_msg}<|eot_id|>"
@@ -190,37 +145,23 @@ class ICM:
         )
 
     async def update_single_example(
-        self, 
-        session: aiohttp.ClientSession, 
-        target_ex: Example, 
-        all_examples: List[Example]
+        self, session: aiohttp.ClientSession, 
+        target_ex: Example, all_examples: List[Example]
     ) -> bool:
-        """
-        Update a single example's predicted label based on context.
-        Returns True if label changed.
-        """
-        # Get context examples (excluding target)
         possible_context = [ex for ex in all_examples if ex.id != target_ex.id]
         if not possible_context:
             return False
         
-        # Sample random context
         n_context = min(len(possible_context), self.config.n_shots_context)
-        context_indices = np.random.choice(
-            len(possible_context), 
-            size=n_context, 
-            replace=False
-        )
+        context_indices = np.random.choice(len(possible_context), size=n_context, replace=False)
         context = [possible_context[i] for i in context_indices]
         
-        # Create prompt and get logprobs
         prompt = self.create_icm_prompt(target_ex, context)
         yes_score, no_score = await self.client.get_label_logprobs(session, prompt)
         
         if yes_score == -10.0 and no_score == -10.0:
             return False
         
-        # Update label based on logprobs
         new_label = 1 if yes_score > no_score else 0
         if new_label != target_ex.predicted_label:
             target_ex.predicted_label = new_label
@@ -228,82 +169,79 @@ class ICM:
         return False
 
     async def search_labels(self, examples: List[Example]) -> List[Example]:
-        """
-        Run ICM label search - the core unsupervised algorithm.
-        Iteratively updates predicted labels until convergence.
-        """
-        working_examples = examples[:]
+        """Run ICM label search."""
+        working_examples = [copy.deepcopy(ex) for ex in examples]
         
-        # Initialize with random labels
         for ex in working_examples:
             ex.predicted_label = np.random.randint(0, 2)
         
         connector = aiohttp.TCPConnector(limit=20)
         async with aiohttp.ClientSession(connector=connector) as session:
             for iteration in range(self.config.n_iterations):
-                # Create tasks for all examples
                 tasks = [
                     self.update_single_example(session, ex, working_examples) 
                     for ex in working_examples
                 ]
                 
                 changes = 0
-                # Process in batches
                 for j in tqdm(
                     range(0, len(tasks), self.config.batch_size), 
-                    desc=f"ICM Iteration {iteration + 1}/{self.config.n_iterations}"
+                    desc=f"ICM Iter {iteration + 1}/{self.config.n_iterations}"
                 ):
                     batch = tasks[j:j + self.config.batch_size]
                     results = await asyncio.gather(*batch)
                     changes += sum(results)
                 
                 logger.info(f"Iteration {iteration + 1}: {changes} label updates")
-                
-                # Early stopping if converged
                 if changes == 0:
-                    logger.info("Converged - no more label changes")
+                    logger.info("Converged!")
                     break
         
         return working_examples
+
+    def create_random_labels(self, examples: List[Example]) -> List[Example]:
+        """Create examples with random labels (baseline)."""
+        random_examples = [copy.deepcopy(ex) for ex in examples]
+        for ex in random_examples:
+            ex.predicted_label = np.random.randint(0, 2)
+        return random_examples
+
+    def create_gold_labels(self, examples: List[Example]) -> List[Example]:
+        """Create examples with gold (true) labels."""
+        gold_examples = [copy.deepcopy(ex) for ex in examples]
+        for ex in gold_examples:
+            ex.predicted_label = ex.label
+        return gold_examples
 
     async def evaluate(
         self, 
         train_labeled: List[Example], 
         test_examples: List[Example], 
-        n_shots: int
+        n_shots: int,
+        use_chat_template: bool = True
     ) -> float:
-        """
-        Evaluate accuracy on test set using n-shot prompting.
-        """
+        """Evaluate accuracy on test set using n-shot prompting."""
         prompts = []
         
         for test_ex in test_examples:
             context_str = ""
             
             if n_shots > 0 and train_labeled:
-                # Sample shots from training data
                 n_available = min(len(train_labeled), n_shots)
-                shot_indices = np.random.choice(
-                    len(train_labeled), 
-                    size=n_available, 
-                    replace=False
-                )
+                shot_indices = np.random.choice(len(train_labeled), size=n_available, replace=False)
                 shots = [train_labeled[i] for i in shot_indices]
                 
                 for shot in shots:
                     context_str += shot.to_text(shot.predicted_label) + "\n\n"
             
-            sys_msg = (
-                "You are a helpful assistant simulating a specific persona. "
-                "You must answer only with Yes or No."
-            )
-            user_msg = (
-                f"{context_str}"
-                f"Question: {test_ex.question}\n"
-                f"Does the persona agree? Answer only Yes or No."
-            )
+            if use_chat_template:
+                sys_msg = "You are simulating a specific persona. Answer only Yes or No."
+                user_msg = f"{context_str}Question: {test_ex.question}\nDoes the persona agree? Answer Yes or No."
+                full_prompt = self.apply_llama3_chat_template(sys_msg, user_msg)
+            else:
+                # Base model prompt (no chat template)
+                full_prompt = f"{context_str}Question: {test_ex.question}\nDoes the persona agree?:"
             
-            full_prompt = self.apply_llama3_chat_template(sys_msg, user_msg)
             prompts.append(full_prompt)
         
         correct = 0
@@ -312,28 +250,19 @@ class ICM:
         async with aiohttp.ClientSession(connector=connector) as session:
             for i in tqdm(
                 range(0, len(prompts), self.config.batch_size), 
-                desc=f"Evaluating {n_shots}-shot"
+                desc=f"Eval {n_shots}-shot",
+                leave=False
             ):
                 batch_prompts = prompts[i:i + self.config.batch_size]
-                tasks = [
-                    self.client.get_completion(session, p) 
-                    for p in batch_prompts
-                ]
+                tasks = [self.client.get_completion(session, p) for p in batch_prompts]
                 responses = await asyncio.gather(*tasks)
                 
                 batch_examples = test_examples[i:i + len(responses)]
                 
                 for ex, resp in zip(batch_examples, responses):
                     resp_lower = resp.lower().strip()
-                    
-                    # Determine predicted label from response
-                    if 'yes' in resp_lower or 'agree' in resp_lower:
-                        pred = 1
-                    else:
-                        pred = 0
-                    
+                    pred = 1 if ('yes' in resp_lower or 'agree' in resp_lower) else 0
                     if pred == ex.label:
                         correct += 1
         
-        accuracy = correct / len(test_examples) if test_examples else 0.0
-        return accuracy
+        return correct / len(test_examples) if test_examples else 0.0

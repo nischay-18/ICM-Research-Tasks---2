@@ -1,9 +1,15 @@
 # run.py
 """
-ICM Persona Elicitation Experiment
+ICM Persona Elicitation Experiment (CORRECTED VERSION)
+
+Uses the corrected ICM implementation with:
+- Simulated Annealing
+- Consistency Penalty I(D)
+- Proper objective function U(D) = α·P(D) - I(D)
+
 Generates:
 - Figure 1: Aggregated bar chart (all personas combined)
-- Figure 2: Line chart comparing ICM vs Random vs Gold
+- Figure 2: Bar chart comparing ICM vs Random vs Gold
 - Per-country results
 """
 
@@ -14,9 +20,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from icm_core import ICM, ICMConfig, Example
-from data_loader import prepare_country_data, get_available_countries
 from dotenv import load_dotenv
+
+# Use the CORRECTED ICM implementation
+from icm_core_corrected import ICM, ICMConfig, Example
+from data_loader import prepare_country_data, get_available_countries
 
 load_dotenv()
 
@@ -27,7 +35,6 @@ OUTPUT_DIR = "results"
 def setup_output_dir():
     """Create output directory structure."""
     if os.path.exists(OUTPUT_DIR):
-        # Backup old results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_dir = f"{OUTPUT_DIR}_backup_{timestamp}"
         shutil.move(OUTPUT_DIR, backup_dir)
@@ -42,7 +49,8 @@ def setup_output_dir():
 async def run_country_eval(
     country: str, 
     icm: ICM,
-    n_samples: int = None
+    n_samples: int = None,
+    use_chat_template: bool = True  # NEW: Pass this based on model type
 ) -> dict:
     """Run ICM evaluation for a single country persona."""
     
@@ -65,7 +73,7 @@ async def run_country_eval(
     print(f"Data: {len(train_data)} train, {len(test_data)} test")
     
     # Create label sets
-    print("\n--- Running ICM Label Search ---")
+    print("\n--- Running ICM Label Search (Simulated Annealing) ---")
     icm_labeled = await icm.search_labels(train_data)
     gold_labeled = icm.create_gold_labels(train_data)
     random_labeled = icm.create_random_labels(train_data)
@@ -74,12 +82,17 @@ async def run_country_eval(
     icm_matches = sum(1 for i, ex in enumerate(icm_labeled) if ex.predicted_label == train_data[i].label)
     print(f"ICM-Gold agreement: {icm_matches}/{len(train_data)} ({100*icm_matches/len(train_data):.1f}%)")
     
+    # Check label distribution (should be balanced with corrected ICM)
+    icm_yes = sum(1 for ex in icm_labeled if ex.predicted_label == 1)
+    print(f"ICM label distribution: {icm_yes}/{len(icm_labeled)} Yes ({100*icm_yes/len(icm_labeled):.1f}%)")
+    
     # Evaluate all conditions
     results = {
         'country': country,
         'train_size': len(train_data),
         'test_size': len(test_data),
         'icm_gold_agreement': icm_matches / len(train_data),
+        'icm_label_balance': icm_yes / len(icm_labeled),
         'shots': [],
         'zero_shot_base': 0,
         'zero_shot_chat': 0,
@@ -93,9 +106,14 @@ async def run_country_eval(
     results['zero_shot_base'] = await icm.evaluate([], test_data, n_shots=0, use_chat_template=False)
     print(f"Zero-shot (Base): {results['zero_shot_base']:.4f}")
     
-    print("--- Evaluating Zero-shot (Chat) ---")
-    results['zero_shot_chat'] = await icm.evaluate([], test_data, n_shots=0, use_chat_template=True)
-    print(f"Zero-shot (Chat): {results['zero_shot_chat']:.4f}")
+    if use_chat_template:
+        print("--- Evaluating Zero-shot (Chat) ---")
+        results['zero_shot_chat'] = await icm.evaluate([], test_data, n_shots=0, use_chat_template=True)
+        print(f"Zero-shot (Chat): {results['zero_shot_chat']:.4f}")
+    else:
+        # For BASE model, can't do chat template - use same as base
+        results['zero_shot_chat'] = results['zero_shot_base']
+        print("--- Zero-shot (Chat): Skipped (BASE model, no chat template) ---")
     
     # Few-shot evaluations
     shot_counts = [2, 4, 8, 16]
@@ -103,9 +121,10 @@ async def run_country_eval(
     for k in shot_counts:
         print(f"\n--- Evaluating {k}-shot ---")
         
-        icm_acc = await icm.evaluate(icm_labeled, test_data, n_shots=k)
-        gold_acc = await icm.evaluate(gold_labeled, test_data, n_shots=k)
-        random_acc = await icm.evaluate(random_labeled, test_data, n_shots=k)
+        # CRITICAL: Use correct template based on model type
+        icm_acc = await icm.evaluate(icm_labeled, test_data, n_shots=k, use_chat_template=use_chat_template)
+        gold_acc = await icm.evaluate(gold_labeled, test_data, n_shots=k, use_chat_template=use_chat_template)
+        random_acc = await icm.evaluate(random_labeled, test_data, n_shots=k, use_chat_template=use_chat_template)
         
         results['shots'].append(k)
         results['icm'].append(icm_acc)
@@ -162,41 +181,25 @@ def save_country_results(country: str, results: dict):
 
 
 def generate_figure1(all_results: list):
-    """
-    Generate Figure 1: Aggregated bar chart - ICM Paper Style
-    Shows SINGLE bars for: Zero-shot (Base), Zero-shot (Chat), Gold, ICM
-    Aggregated across all personas and all shot counts.
-    """
+    """Generate Figure 1: Aggregated bar chart - ICM Paper Style."""
     valid_results = [r for r in all_results if r is not None]
     if not valid_results:
         print("No valid results for Figure 1")
         return
     
-    # Aggregate metrics across all countries
     avg_zero_base = np.mean([r['zero_shot_base'] for r in valid_results])
     avg_zero_chat = np.mean([r['zero_shot_chat'] for r in valid_results])
-    
-    # For ICM and Gold, take the BEST performance across shot counts (or average)
-    # Using average across all shot counts for fair comparison
-    avg_icm = np.mean([np.mean(r['icm']) for r in valid_results])
-    avg_gold = np.mean([np.mean(r['gold']) for r in valid_results])
-    
-    # Also compute best (max) across shots
     best_icm = np.mean([max(r['icm']) for r in valid_results])
     best_gold = np.mean([max(r['gold']) for r in valid_results])
     
-    # Create figure matching ICM paper style
     fig, ax = plt.subplots(figsize=(10, 7))
     
-    # Categories and values (using best performance for few-shot methods)
     categories = ['Zero-shot\n(Base)', 'Zero-shot\n(Chat)', 'Gold\nSupervision', 'ICM\n(Unsupervised)']
     values = [avg_zero_base, avg_zero_chat, best_gold, best_icm]
-    colors = ['#9C27B0', '#E91E63', '#FF9800', '#00BCD4']  # Purple, Pink, Orange, Cyan
+    colors = ['#9C27B0', '#E91E63', '#FF9800', '#00BCD4']
     
-    # Create bars
     bars = ax.bar(categories, values, color=colors, width=0.6, edgecolor='black', linewidth=1.2)
     
-    # Add value labels on bars
     for bar, val in zip(bars, values):
         height = bar.get_height()
         ax.annotate(f'{val:.2f}',
@@ -209,9 +212,6 @@ def generate_figure1(all_results: list):
     ax.set_title('Figure 1: GlobalOpinionQA Performance\n(Aggregated across all personas)', fontsize=14, fontweight='bold')
     ax.set_ylim(0, 1.0)
     ax.grid(True, axis='y', alpha=0.3)
-    ax.set_axisbelow(True)
-    
-    # Add a subtle background
     ax.set_facecolor('#fafafa')
     
     plt.tight_layout()
@@ -224,31 +224,13 @@ def generate_figure1(all_results: list):
     print(f"  Gold (best): {best_gold:.3f}")
     print(f"  ICM (best): {best_icm:.3f}")
     
-    # Save aggregated data
-    agg_df = pd.DataFrame({
-        'Condition': categories,
-        'Accuracy': values
-    })
-    agg_df.to_csv(f"{OUTPUT_DIR}/csv/figure1_data.csv", index=False)
-    
-    # Also save detailed aggregated results
-    shot_counts = valid_results[0]['shots']
-    detailed_df = pd.DataFrame({
-        'shots': shot_counts,
-        'zero_shot_base': [avg_zero_base]*len(shot_counts),
-        'zero_shot_chat': [avg_zero_chat]*len(shot_counts),
-        'icm': [np.mean([r['icm'][i] for r in valid_results]) for i in range(len(shot_counts))],
-        'gold': [np.mean([r['gold'][i] for r in valid_results]) for i in range(len(shot_counts))],
-        'random': [np.mean([r['random'][i] for r in valid_results]) for i in range(len(shot_counts))]
-    })
-    detailed_df.to_csv(f"{OUTPUT_DIR}/csv/aggregated_results.csv", index=False)
+    # Save data
+    pd.DataFrame({'Condition': categories, 'Accuracy': values}).to_csv(
+        f"{OUTPUT_DIR}/csv/figure1_data.csv", index=False)
 
 
 def generate_figure2(all_results: list):
-    """
-    Generate Figure 2: BAR CHART showing accuracy vs number of examples.
-    Compares ICM, Random, and Gold labels.
-    """
+    """Generate Figure 2: Bar chart comparing ICM vs Random vs Gold."""
     valid_results = [r for r in all_results if r is not None]
     if not valid_results:
         print("No valid results for Figure 2")
@@ -256,23 +238,19 @@ def generate_figure2(all_results: list):
     
     shot_counts = valid_results[0]['shots']
     
-    # Aggregate across countries
     agg_icm = [np.mean([r['icm'][i] for r in valid_results]) for i in range(len(shot_counts))]
     agg_gold = [np.mean([r['gold'][i] for r in valid_results]) for i in range(len(shot_counts))]
     agg_random = [np.mean([r['random'][i] for r in valid_results]) for i in range(len(shot_counts))]
     
-    # Create grouped bar chart
     fig, ax = plt.subplots(figsize=(12, 7))
     
     x = np.arange(len(shot_counts))
-    width = 0.25  # Width of bars
+    width = 0.25
     
-    # Create bars - Random, ICM, Gold (left to right)
     bars1 = ax.bar(x - width, agg_random, width, label='Random Labels', color='#FF9800')
     bars2 = ax.bar(x, agg_icm, width, label='ICM (Unsupervised)', color='#00BCD4')
     bars3 = ax.bar(x + width, agg_gold, width, label='Gold Labels', color='#8BC34A')
     
-    # Add value labels on top of bars
     def add_bar_labels(bars):
         for bar in bars:
             height = bar.get_height()
@@ -288,7 +266,7 @@ def generate_figure2(all_results: list):
     
     ax.set_xlabel('Number of Few-shot Examples', fontsize=12)
     ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('Figure 2: Test Accuracy vs Number of In-Context Examples\n(Comparing ICM, Random, and Gold Labels - Llama-3.1-70B-Instruct)', fontsize=14)
+    ax.set_title('Figure 2: Test Accuracy vs Number of In-Context Examples\n(Comparing ICM, Random, and Gold Labels - Llama-3.1-70B)', fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels([f'{k}-shot' for k in shot_counts])
     ax.set_ylim(0, 1.15)
@@ -318,7 +296,7 @@ def generate_combined_country_plot(all_results: list):
     
     ax.set_xlabel('Number of In-Context Examples', fontsize=12)
     ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('ICM Performance Across Countries\n(Llama-3.1-70B-Instruct)', fontsize=14)
+    ax.set_title('ICM Performance Across Countries\n(Llama-3.1-70B)', fontsize=14)
     ax.set_xticks(valid_results[0]['shots'])
     ax.set_ylim(0, 1.05)
     ax.legend(loc='lower right', fontsize=9, ncol=2)
@@ -333,11 +311,11 @@ def print_summary(all_results: list):
     """Print and save summary table."""
     valid_results = [r for r in all_results if r is not None]
     
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    print(f"{'Country':<20} {'Data':<10} {'Zero-Base':<10} {'Zero-Chat':<10} {'Best ICM':<10} {'Best Gold':<10} {'ICM-Gold%':<10}")
-    print("-"*80)
+    print("\n" + "="*90)
+    print("SUMMARY (Corrected ICM with Simulated Annealing)")
+    print("="*90)
+    print(f"{'Country':<15} {'Data':<8} {'Zero-B':<8} {'Zero-C':<8} {'BestICM':<8} {'BestGold':<8} {'ICM-Gold%':<10} {'Balance':<8}")
+    print("-"*90)
     
     rows = []
     for r in valid_results:
@@ -350,15 +328,24 @@ def print_summary(all_results: list):
             'Best_ICM': max(r['icm']),
             'Best_Gold': max(r['gold']),
             'Best_Random': max(r['random']),
-            'ICM_Gold_Agreement': r['icm_gold_agreement']
+            'ICM_Gold_Agreement': r['icm_gold_agreement'],
+            'ICM_Label_Balance': r.get('icm_label_balance', 0.5)
         }
         rows.append(row)
-        print(f"{r['country']:<20} {r['train_size']+r['test_size']:<10} {r['zero_shot_base']:<10.3f} {r['zero_shot_chat']:<10.3f} {max(r['icm']):<10.3f} {max(r['gold']):<10.3f} {r['icm_gold_agreement']*100:<10.1f}%")
+        balance = r.get('icm_label_balance', 0.5)
+        print(f"{r['country']:<15} {r['train_size']+r['test_size']:<8} {r['zero_shot_base']:<8.3f} {r['zero_shot_chat']:<8.3f} {max(r['icm']):<8.3f} {max(r['gold']):<8.3f} {r['icm_gold_agreement']*100:<10.1f}% {balance*100:<8.1f}%")
     
-    # Save summary
     summary_df = pd.DataFrame(rows)
     summary_df.to_csv(f"{OUTPUT_DIR}/csv/summary.csv", index=False)
     print(f"\nSaved: {OUTPUT_DIR}/csv/summary.csv")
+    
+    # Print aggregate statistics
+    print("\n" + "-"*50)
+    print("AGGREGATE STATISTICS:")
+    print(f"  Avg ICM-Gold Agreement: {np.mean([r['icm_gold_agreement'] for r in valid_results])*100:.1f}%")
+    print(f"  Avg Label Balance: {np.mean([r.get('icm_label_balance', 0.5) for r in valid_results])*100:.1f}% Yes")
+    print(f"  Avg Best ICM: {np.mean([max(r['icm']) for r in valid_results]):.3f}")
+    print(f"  Avg Best Gold: {np.mean([max(r['gold']) for r in valid_results]):.3f}")
 
 
 async def test_api_connection(base_url: str, model_name: str, api_key: str = ""):
@@ -373,6 +360,7 @@ async def test_api_connection(base_url: str, model_name: str, api_key: str = "")
     payload = {"model": model_name, "prompt": "Hello", "max_tokens": 5, "temperature": 0.0}
     
     print(f"Testing API: {url}")
+    print(f"Model: {model_name}")
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -383,7 +371,7 @@ async def test_api_connection(base_url: str, model_name: str, api_key: str = "")
                     return True
                 else:
                     text = await response.text()
-                    print(f"✗ API error {response.status}: {text[:100]}")
+                    print(f"✗ API error {response.status}: {text[:200]}")
                     return False
     except Exception as e:
         print(f"✗ Connection failed: {e}")
@@ -393,59 +381,103 @@ async def test_api_connection(base_url: str, model_name: str, api_key: str = "")
 async def main():
     """Main entry point."""
     
+    # =========================================================
+    # MODEL CONFIGURATION
+    # =========================================================
     API_KEY = os.getenv("RUNPOD_API_KEY", "")
     BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1")
+    
+    # Choose your model:
+    # - BASE: "meta-llama/Meta-Llama-3.1-70B" (paper-accurate, no chat template)
+    # - INSTRUCT: "meta-llama/Meta-Llama-3.1-70B-Instruct" (recommended, has chat template)
     MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Meta-Llama-3.1-70B-Instruct")
+    
+    # Auto-detect if using BASE or INSTRUCT model
+    IS_INSTRUCT_MODEL = "instruct" in MODEL_NAME.lower() or "chat" in MODEL_NAME.lower()
+    USE_CHAT_TEMPLATE = IS_INSTRUCT_MODEL  # Only use chat template for instruct models
     
     print("="*60)
     print("ICM Persona Elicitation Experiment")
+    print("CORRECTED VERSION - Simulated Annealing + Consistency Penalty")
     print("="*60)
     print(f"Model: {MODEL_NAME}")
+    print(f"Model Type: {'INSTRUCT (chat template enabled)' if IS_INSTRUCT_MODEL else 'BASE (no chat template)'}")
     print(f"API: {BASE_URL}")
     
     # Test API
     if not await test_api_connection(BASE_URL, MODEL_NAME, API_KEY):
         print("\nERROR: Cannot connect to vLLM API")
+        print("Make sure vLLM is running with the correct model loaded.")
         return
     
     # Setup output directory
     setup_output_dir()
     
     # =========================================================
-    # CONFIGURATION
+    # EXPERIMENT CONFIGURATION
     # =========================================================
     
-    # Countries to process (using EXACT dataset names)
-    # Run get_available_countries() to see all options
     countries = [
-    "Kenya",
-    "Ethiopia", 
-    "Zimbabwe",
-    "Russia",
-    "Germany",
-    "Pakistan",
-    "Turkey",
-    "United States",
-    "Lebanon",
-    "Nigeria",
+        "Kenya",
+        "Ethiopia", 
+        "Zimbabwe",
+        "Russia",
+        "Germany",
+        "Pakistan",
+        "Turkey",
+        "United States",
+        "Lebanon",
+        "Nigeria",
     ]
     
-    # Use all available data (None) or limit samples
     n_samples = None  # None = all data
     
     print(f"\nCountries: {countries}")
     print(f"Samples: {'ALL' if n_samples is None else n_samples}")
+    
+    # =========================================================
+    # ICM CONFIGURATION (Corrected - matching paper)
+    # =========================================================
+    config = ICMConfig(
+        # Simulated Annealing parameters
+        initial_temperature=3.0,
+        final_temperature=0.001,
+        cooling_rate=0.98,
+        
+        # Objective function
+        alpha=100.0,
+        
+        # Search parameters
+        max_iterations=500,
+        
+        # Context
+        n_shots_context=8,
+        batch_size=10,
+        
+        # Consistency penalty
+        class_balance_threshold=0.8,
+        consistency_weight=1.0,
+        
+        # Restarts (optional with proper SA)
+        n_restarts=1
+    )
+    
+    print(f"\nICM Configuration:")
+    print(f"  Temperature: {config.initial_temperature} -> {config.final_temperature}")
+    print(f"  Cooling rate: {config.cooling_rate}")
+    print(f"  Max iterations: {config.max_iterations}")
+    print(f"  Alpha: {config.alpha}")
+    print(f"  Class balance threshold: {config.class_balance_threshold}")
     print("="*60)
     
     # Initialize ICM
-    config = ICMConfig(n_iterations=5, batch_size=10, n_shots_context=8)
     icm = ICM(API_KEY, BASE_URL, MODEL_NAME, config)
     
     # Run evaluations
     all_results = []
     for country in countries:
         try:
-            result = await run_country_eval(country, icm, n_samples)
+            result = await run_country_eval(country, icm, n_samples, use_chat_template=USE_CHAT_TEMPLATE)
             all_results.append(result)
         except Exception as e:
             print(f"\nERROR with {country}: {e}")

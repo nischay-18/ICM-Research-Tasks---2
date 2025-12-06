@@ -23,7 +23,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # Use the CORRECTED ICM implementation
-from icm_core_corrected import ICM, ICMConfig, Example
+from icm_core import ICM, ICMConfig, Example
 from data_loader import prepare_country_data, get_available_countries
 
 load_dotenv()

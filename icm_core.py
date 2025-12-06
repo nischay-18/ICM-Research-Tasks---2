@@ -1,20 +1,12 @@
-# icm_core.py
-"""
-Improved ICM (In-Context Matching) implementation for persona elicitation.
-Key improvements:
-1. Multiple random restarts to find best solution
-2. Better prompt formatting
-3. Coherence measurement
-4. More iterations for convergence
-"""
 import numpy as np
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+from dataclasses import dataclass, field
 import asyncio
 from tqdm import tqdm
 import logging
 import aiohttp
 import copy
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,19 +14,39 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ICMConfig:
-    n_iterations: int = 10  # More iterations for convergence
-    batch_size: int = 10
-    n_shots_context: int = 8
-    n_restarts: int = 3  # Multiple random restarts
+    """Configuration matching the paper's algorithm."""
+    # Simulated Annealing parameters (from reference implementation)
+    initial_temperature: float = 3.0      # Starting temperature
+    final_temperature: float = 0.001      # Ending temperature  
+    cooling_rate: float = 0.98            # Temperature decay per iteration
+    
+    # Objective function
+    alpha: float = 100.0                  # Weight for P(D) vs I(D)
+    
+    # Search parameters
+    max_iterations: int = 500             # Maximum SA iterations
+    initial_examples: int = 20            # Start with K random labels
+    
+    # Context and batching
+    n_shots_context: int = 8              # Context window size
+    batch_size: int = 10                  # Batch size for API calls
+    
+    # Consistency penalty parameters
+    class_balance_threshold: float = 0.8  # Penalize if one class > 80%
+    consistency_weight: float = 1.0       # Weight for I(D) penalty
+    
+    # Restarts (optional, but less critical with proper SA)
+    n_restarts: int = 1
 
 
 @dataclass
 class Example:
     question: str
     choice: str
-    label: Optional[int] = None
-    predicted_label: int = 0
+    label: Optional[int] = None       # Gold label (ground truth)
+    predicted_label: int = 0          # ICM-assigned label
     id: str = ""
+    logprob_cache: Dict[int, float] = field(default_factory=dict)  # Cache logprobs
     
     def to_text(self, label_val: int) -> str:
         lbl_str = "Yes" if label_val == 1 else "No"
@@ -51,7 +63,7 @@ class VLLMClient:
         if api_key and api_key.strip():
             self.headers["Authorization"] = f"Bearer {api_key}"
         self.model_name = model_name
-        logger.info(f"VLLMClient: {self.base_url}, model: {model_name}")
+        logger.info(f"VLLMClient initialized: {self.base_url}")
     
     async def get_label_logprobs(
         self, 
@@ -91,10 +103,10 @@ class VLLMClient:
                 
                 for token, logprob in top_dict.items():
                     t = token.lower().strip()
-                    # Handle various tokenizations
+                    # Handle various tokenizations (yes, Yes, ĠYes, ' yes', y, Y)
                     if 'yes' in t or t == 'y':
                         yes_score = max(yes_score, logprob)
-                    if 'no' in t or t == 'n':
+                    if 'no' in t or (t == 'n' and 'no' not in t):
                         no_score = max(no_score, logprob)
                 
                 return yes_score, no_score
@@ -130,11 +142,21 @@ class VLLMClient:
 
 
 class ICM:
-    """In-Context Matching for persona elicitation."""
+    """
+    Internal Coherence Maximization with proper Simulated Annealing.
+    
+    Objective: U(D) = α·P_θ(D) - I(D)
+    
+    Where:
+    - P_θ(D) = Σᵢ log P(yᵢ | xᵢ, D\{i}) is mutual predictability
+    - I(D) is the inconsistency/degeneracy penalty
+    - α balances the two terms
+    """
     
     def __init__(self, api_key: str, base_url: str, model_name: str, config: ICMConfig):
         self.config = config
         self.client = VLLMClient(api_key, base_url, model_name)
+        self._context_cache = {}  # Cache for stable context selection
 
     def create_icm_prompt(self, target_ex: Example, context_examples: List[Example]) -> str:
         """Create ICM prompt for label prediction."""
@@ -156,131 +178,271 @@ class ICM:
             f"<|start_header_id|>assistant<|end_header_id|>\n\n"
         )
 
-    async def update_single_example(
-        self, session: aiohttp.ClientSession, 
-        target_ex: Example, all_examples: List[Example]
-    ) -> Tuple[bool, float]:
-        """Update single example label based on context."""
-        possible_context = [ex for ex in all_examples if ex.id != target_ex.id]
-        if not possible_context:
-            return False, 0.0
-        
-        n_context = min(len(possible_context), self.config.n_shots_context)
-        context_indices = np.random.choice(len(possible_context), size=n_context, replace=False)
-        context = [possible_context[i] for i in context_indices]
-        
-        prompt = self.create_icm_prompt(target_ex, context)
-        yes_score, no_score = await self.client.get_label_logprobs(session, prompt)
-        
-        if yes_score == -100.0 and no_score == -100.0:
-            return False, 0.0
-        
-        confidence = abs(yes_score - no_score)
-        new_label = 1 if yes_score > no_score else 0
-        
-        if new_label != target_ex.predicted_label:
-            target_ex.predicted_label = new_label
-            return True, confidence
-        return False, confidence
-
-    async def run_single_icm(self, examples: List[Example], session: aiohttp.ClientSession) -> Tuple[List[Example], int]:
-        """Run single ICM optimization from random start."""
-        working = [copy.deepcopy(ex) for ex in examples]
-        
-        # Random init
-        for ex in working:
-            ex.predicted_label = np.random.randint(0, 2)
-        
-        total_changes = 0
-        prev_labels = None
-        stable = 0
-        
-        for iteration in range(self.config.n_iterations):
-            indices = np.random.permutation(len(working))
-            changes = 0
-            
-            for j in range(0, len(indices), self.config.batch_size):
-                batch_idx = indices[j:j + self.config.batch_size]
-                tasks = [self.update_single_example(session, working[i], working) for i in batch_idx]
-                results = await asyncio.gather(*tasks)
-                changes += sum(1 for changed, _ in results if changed)
-            
-            total_changes += changes
-            
-            # Check convergence
-            current = tuple(ex.predicted_label for ex in working)
-            if current == prev_labels:
-                stable += 1
-                if stable >= 2:
-                    break
-            else:
-                stable = 0
-            prev_labels = current
-            
-            if changes == 0:
-                break
-        
-        return working, total_changes
-
-    async def search_labels(self, examples: List[Example]) -> List[Example]:
+    def calculate_inconsistency_penalty(self, examples: List[Example]) -> float:
         """
-        Run ICM label search with multiple restarts.
-        Returns the solution with highest internal coherence.
+        Calculate I(D) - the logical inconsistency penalty.
+        
+        Penalizes:
+        1. Class imbalance (mode collapse to all-Yes or all-No)
+        2. Can be extended with domain-specific logical constraints
         """
-        logger.info(f"Starting ICM search with {self.config.n_restarts} restarts, {self.config.n_iterations} iterations each")
-        
-        best_examples = None
-        best_agreement = -1
-        
-        connector = aiohttp.TCPConnector(limit=20)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            for restart in range(self.config.n_restarts):
-                logger.info(f"=== ICM Restart {restart + 1}/{self.config.n_restarts} ===")
-                
-                working, changes = await self.run_single_icm(examples, session)
-                
-                # Measure agreement with gold (for logging, not selection)
-                gold_agreement = sum(1 for i, ex in enumerate(working) if ex.predicted_label == examples[i].label)
-                gold_pct = gold_agreement / len(examples) * 100
-                
-                # Measure internal consistency
-                consistency = await self.measure_consistency(working, session)
-                
-                logger.info(f"Restart {restart + 1}: Gold agreement={gold_pct:.1f}%, Consistency={consistency:.1f}%")
-                
-                # Select based on consistency (not gold agreement - that would be cheating!)
-                if consistency > best_agreement:
-                    best_agreement = consistency
-                    best_examples = [copy.deepcopy(ex) for ex in working]
-        
-        # Final stats
-        final_gold = sum(1 for i, ex in enumerate(best_examples) if ex.predicted_label == examples[i].label)
-        logger.info(f"Best solution: Consistency={best_agreement:.1f}%, Gold agreement={final_gold/len(examples)*100:.1f}%")
-        
-        return best_examples
-
-    async def measure_consistency(self, examples: List[Example], session: aiohttp.ClientSession) -> float:
-        """Measure how consistent the labeling is (internal coherence)."""
-        if len(examples) < 5:
+        if not examples:
             return 0.0
         
-        consistent = 0
-        total = min(25, len(examples))
-        test_indices = np.random.choice(len(examples), size=total, replace=False)
+        # Count class distribution
+        n_yes = sum(1 for ex in examples if ex.predicted_label == 1)
+        n_total = len(examples)
         
-        for idx in test_indices:
+        if n_total == 0:
+            return 0.0
+        
+        yes_ratio = n_yes / n_total
+        
+        # Penalty for class imbalance (mode collapse)
+        # Penalize if distribution is too skewed (> threshold)
+        penalty = 0.0
+        
+        if yes_ratio > self.config.class_balance_threshold:
+            # Too many Yes labels
+            penalty = (yes_ratio - self.config.class_balance_threshold) * 10.0
+        elif yes_ratio < (1 - self.config.class_balance_threshold):
+            # Too many No labels
+            penalty = ((1 - self.config.class_balance_threshold) - yes_ratio) * 10.0
+        
+        # Additional entropy-based penalty (encourage diversity)
+        if yes_ratio > 0 and yes_ratio < 1:
+            entropy = -yes_ratio * math.log(yes_ratio) - (1-yes_ratio) * math.log(1-yes_ratio)
+            max_entropy = math.log(2)  # Maximum entropy for binary
+            # Penalize low entropy (low diversity)
+            penalty += (1 - entropy / max_entropy) * 2.0
+        else:
+            # Degenerate case: all same label
+            penalty += 5.0  # Strong penalty for complete collapse
+        
+        return penalty * self.config.consistency_weight
+
+    async def calculate_mutual_predictability(
+        self, 
+        examples: List[Example], 
+        session: aiohttp.ClientSession,
+        sample_size: int = None
+    ) -> float:
+        """
+        Calculate P_θ(D) = Σᵢ log P(yᵢ | xᵢ, D\{i})
+        
+        For efficiency, we sample a subset of examples.
+        """
+        if not examples:
+            return 0.0
+        
+        # Sample for efficiency
+        if sample_size is None:
+            sample_size = min(30, len(examples))
+        
+        indices = np.random.choice(len(examples), size=sample_size, replace=False)
+        
+        total_logprob = 0.0
+        valid_count = 0
+        
+        for idx in indices:
             target = examples[idx]
-            context = [ex for i, ex in enumerate(examples) if i != idx][:self.config.n_shots_context]
+            
+            # Get context (all others, limited to n_shots)
+            context = [ex for i, ex in enumerate(examples) if i != idx]
+            context = context[:self.config.n_shots_context]
             
             prompt = self.create_icm_prompt(target, context)
             yes_score, no_score = await self.client.get_label_logprobs(session, prompt)
             
             if yes_score != -100.0 or no_score != -100.0:
-                predicted = 1 if yes_score > no_score else 0
-                if predicted == target.predicted_label:
-                    consistent += 1
+                # Get logprob of the assigned label
+                if target.predicted_label == 1:
+                    logprob = yes_score
+                else:
+                    logprob = no_score
+                
+                if logprob > -100.0:
+                    total_logprob += logprob
+                    valid_count += 1
         
-        return consistent / total * 100
+        # Normalize by count
+        if valid_count > 0:
+            return total_logprob / valid_count
+        return -100.0
+
+    async def calculate_objective(
+        self, 
+        examples: List[Example], 
+        session: aiohttp.ClientSession
+    ) -> Tuple[float, float, float]:
+        """
+        Calculate U(D) = α·P_θ(D) - I(D)
+        """
+        # Mutual predictability
+        p_score = await self.calculate_mutual_predictability(examples, session)
+        
+        # Inconsistency penalty
+        i_penalty = self.calculate_inconsistency_penalty(examples)
+        
+        # Combined objective
+        u_score = self.config.alpha * p_score - i_penalty
+        
+        return u_score, p_score, i_penalty
+
+    async def get_label_scores(
+        self, 
+        target_ex: Example, 
+        context: List[Example],
+        session: aiohttp.ClientSession
+    ) -> Tuple[float, float]:
+        """Get logprob scores for Yes/No for a target example."""
+        prompt = self.create_icm_prompt(target_ex, context)
+        return await self.client.get_label_logprobs(session, prompt)
+
+    def metropolis_accept(self, delta_u: float, temperature: float) -> bool:
+        """
+        Metropolis acceptance criterion for Simulated Annealing.
+        
+        Accept if:
+        - delta_u > 0 (improvement), OR
+        - random < exp(delta_u / T) (probabilistic acceptance of worse moves)
+        """
+        if delta_u > 0:
+            return True
+        
+        if temperature <= 0:
+            return False
+        
+        # Probabilistic acceptance
+        acceptance_prob = math.exp(delta_u / temperature)
+        return np.random.random() < acceptance_prob
+
+    async def search_labels(self, examples: List[Example]) -> List[Example]:
+        """
+        Run ICM label search using Simulated Annealing.
+        
+        Algorithm (from paper):
+        1. Initialize with K random labels
+        2. Iteratively:
+           a. Sample a new example
+           b. Determine optimal label (fixing inconsistencies)
+           c. Accept/reject based on scoring function and temperature
+        3. Cool temperature over time
+        """
+        logger.info(f"Starting ICM search with Simulated Annealing")
+        logger.info(f"  Temperature: {self.config.initial_temperature} -> {self.config.final_temperature}")
+        logger.info(f"  Cooling rate: {self.config.cooling_rate}")
+        logger.info(f"  Max iterations: {self.config.max_iterations}")
+        logger.info(f"  Alpha: {self.config.alpha}")
+        
+        best_examples = None
+        best_score = float('-inf')
+        
+        connector = aiohttp.TCPConnector(limit=20)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            
+            for restart in range(self.config.n_restarts):
+                if self.config.n_restarts > 1:
+                    logger.info(f"=== Restart {restart + 1}/{self.config.n_restarts} ===")
+                
+                # Initialize working copy
+                working = [copy.deepcopy(ex) for ex in examples]
+                
+                # Step 1: Random initialization
+                for ex in working:
+                    ex.predicted_label = np.random.randint(0, 2)
+                
+                # Calculate initial objective
+                current_score, p_score, i_penalty = await self.calculate_objective(working, session)
+                logger.info(f"Initial: U={current_score:.2f}, P={p_score:.2f}, I={i_penalty:.2f}")
+                
+                # Step 2: Simulated Annealing loop
+                temperature = self.config.initial_temperature
+                
+                accepted = 0
+                rejected = 0
+                
+                pbar = tqdm(range(self.config.max_iterations), desc="SA Search", leave=False)
+                
+                for iteration in pbar:
+                    # Pick a random example to potentially flip
+                    idx = np.random.randint(len(working))
+                    target = working[idx]
+                    
+                    # Store old label
+                    old_label = target.predicted_label
+                    
+                    # Get context for this example (stable selection)
+                    context = [ex for i, ex in enumerate(working) if i != idx]
+                    context = context[:self.config.n_shots_context]
+                    
+                    # Get model's preference
+                    yes_score, no_score = await self.get_label_scores(target, context, session)
+                    
+                    # Determine proposed new label
+                    if yes_score == -100.0 and no_score == -100.0:
+                        continue  # Skip if API failed
+                    
+                    proposed_label = 1 if yes_score > no_score else 0
+                    
+                    if proposed_label == old_label:
+                        # No change proposed, continue
+                        continue
+                    
+                    # Tentatively apply the change
+                    target.predicted_label = proposed_label
+                    
+                    # Calculate new objective
+                    new_score, new_p, new_i = await self.calculate_objective(working, session)
+                    
+                    delta_u = new_score - current_score
+                    
+                    # Metropolis acceptance
+                    if self.metropolis_accept(delta_u, temperature):
+                        # Accept the change
+                        current_score = new_score
+                        accepted += 1
+                    else:
+                        # Reject - revert
+                        target.predicted_label = old_label
+                        rejected += 1
+                    
+                    # Cool down temperature
+                    temperature = max(
+                        self.config.final_temperature,
+                        temperature * self.config.cooling_rate
+                    )
+                    
+                    # Update progress bar
+                    if iteration % 20 == 0:
+                        yes_count = sum(1 for ex in working if ex.predicted_label == 1)
+                        pbar.set_postfix({
+                            'U': f'{current_score:.1f}',
+                            'T': f'{temperature:.3f}',
+                            'Yes%': f'{100*yes_count/len(working):.0f}'
+                        })
+                    
+                    # Early stopping if temperature is cold and stable
+                    if temperature <= self.config.final_temperature * 2 and rejected > 50:
+                        break
+                
+                # Final statistics
+                final_score, final_p, final_i = await self.calculate_objective(working, session)
+                yes_count = sum(1 for ex in working if ex.predicted_label == 1)
+                gold_match = sum(1 for i, ex in enumerate(working) 
+                               if ex.predicted_label == examples[i].label)
+                
+                logger.info(f"Final: U={final_score:.2f}, P={final_p:.2f}, I={final_i:.2f}")
+                logger.info(f"  Accepted: {accepted}, Rejected: {rejected}")
+                logger.info(f"  Label distribution: {yes_count}/{len(working)} Yes ({100*yes_count/len(working):.1f}%)")
+                logger.info(f"  Gold agreement: {gold_match}/{len(working)} ({100*gold_match/len(working):.1f}%)")
+                
+                # Track best solution
+                if final_score > best_score:
+                    best_score = final_score
+                    best_examples = [copy.deepcopy(ex) for ex in working]
+        
+        return best_examples
 
     def create_random_labels(self, examples: List[Example]) -> List[Example]:
         """Create examples with random labels."""

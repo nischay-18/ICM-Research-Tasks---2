@@ -266,7 +266,7 @@ def generate_figure2(all_results: list):
     
     ax.set_xlabel('Number of Few-shot Examples', fontsize=12)
     ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('Figure 2: Test Accuracy vs Number of In-Context Examples\n(Comparing ICM, Random, and Gold Labels - Llama-3.1-70B)', fontsize=14)
+    ax.set_title('Figure 2: Test Accuracy vs Number of In-Context Examples\n(Comparing ICM, Random, and Gold Labels - Llama-3.1-70B-Instruct)', fontsize=14)
     ax.set_xticks(x)
     ax.set_xticklabels([f'{k}-shot' for k in shot_counts])
     ax.set_ylim(0, 1.15)
@@ -296,7 +296,7 @@ def generate_combined_country_plot(all_results: list):
     
     ax.set_xlabel('Number of In-Context Examples', fontsize=12)
     ax.set_ylabel('Accuracy', fontsize=12)
-    ax.set_title('ICM Performance Across Countries\n(Llama-3.1-70B)', fontsize=14)
+    ax.set_title('ICM Performance Across Countries\n(Llama-3.1-70B-Instruct)', fontsize=14)
     ax.set_xticks(valid_results[0]['shots'])
     ax.set_ylim(0, 1.05)
     ax.legend(loc='lower right', fontsize=9, ncol=2)

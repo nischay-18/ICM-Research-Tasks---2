@@ -1,9 +1,0 @@
-Condition,Accuracy
-"Zero-shot
-(Base)",0.44400051853772365
-"Zero-shot
-(Chat)",0.6439570189842423
-"Gold
-Supervision",0.7329922507417971
-"ICM
-(Unsupervised)",0.6357199032062916

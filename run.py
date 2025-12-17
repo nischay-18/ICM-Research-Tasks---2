@@ -417,18 +417,7 @@ async def main():
     # EXPERIMENT CONFIGURATION
     # =========================================================
     
-    countries = [
-        "Kenya",
-        "Ethiopia", 
-        "Zimbabwe",
-        "Russia",
-        "Germany",
-        "Pakistan",
-        "Turkey",
-        "United States",
-        "Lebanon",
-        "Nigeria",
-    ]
+    countries = ['Germany', 'United States', 'France', 'Britain', 'Russia', 'Japan', 'Spain', 'Turkey', 'Pakistan', 'Jordan', 'Kenya', 'Lebanon', 'Indonesia', 'Italy']
     
     n_samples = None  # None = all data
     
